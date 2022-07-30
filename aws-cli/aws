@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 [ ${BASH_VERSION%%.*} -lt 4 ] && { echo "Requires bash 4+"; exit 1; }
 
+set \
+  -o errexit \
+  -o pipefail
+
 Depends=("docker")
 for d in ${Depends[@]}; do
   [[ $(which $d) ]] || { echo "Missing dependency: $d"; ! break; }
