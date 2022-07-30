@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+[ ${BASH_VERSION%%.*} -lt 4 ] && { echo "Requires bash 4+"; exit 1; }
+
+Depends=("docker")
+for d in ${Depends[@]}; do
+  [[ $(which $d) ]] || { echo "Missing dependency: $d"; ! break; }
+done || exit
+
+DockerImage="aws-cli:local"
+
+export DOCKER_BUILDKIT=1
+Docker="$(which docker)"
+
+$Docker inspect $DockerImage &> /dev/null || {
+  DockerImageRoot="$(dirname "$(readlink -f "$0")")"
+  printf "\nDocker image:[$DockerImage] missing\n\n"
+  printf "Building docker image:[$DockerImage] from:[$DockerImageRoot] ...\n\n"
+  $Docker build --network=host -t $DockerImage $DockerImageRoot/ \
+  || exit
+}
+
+Docker="$Docker run --rm -i --user $(id -u):$(id -g) --network=host"
+DockerVolumes=(
+  "$PWD:/mnt/work"
+  "$HOME/.aws:/mnt/aws"
+)
+
+[[ ! -d "$HOME/.aws" ]] && { mkdir -p "$HOME/.aws"; chmod 700 "$HOME/.aws"; }
+
+[[ -n $AWS_PROFILE ]] && {
+  Docker="$Docker -e AWS_PROFILE=$AWS_PROFILE"
+}
+
+$Docker ${DockerVolumes[@]/#/-v } $DockerImage "$@"
+
+exit

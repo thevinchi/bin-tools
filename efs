@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+[ ${BASH_VERSION%%.*} -lt 4 ] && { echo "Requires bash 4+"; exit 1; }
+
+MountOptions=(
+  "nfsvers=4.1"
+  "rsize=1048576"
+  "wsize=1048576"
+  "hard"
+  "timeo=600"
+  "retrans=2"
+  "noresvport"
+)
+MountOptions="${MountOptions[@]}" \
+  && MountOptions="${MountOptions// /,}"
+
+# FsTab="$MountOptions,_netdev"
+
+case $1 in
+
+  'mount')
+    sudo mount -t nfs4 -o "$MountOptions" "$2" "$3" \
+    || exit
+    ;;
+
+  'umount')
+    sudo umount "$2" \
+    || exit
+    ;;
+
+  *) exit 1;;
+esac
+
+exit

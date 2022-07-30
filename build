@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+[ ${BASH_VERSION%%.*} -lt 4 ] && { echo "Requires bash 4+"; exit 1; }
+
+set -e
+export DOCKER_BUILDKIT=1
+
+Container="$1"
+[[ -z $Container ]] && { echo "usage: ./build <container>"; exit 1; }
+
+ContainerFile="containers/$Container/Dockerfile"
+[[ ! -r $ContainerFile ]] && { echo "Missing file:[$ContainerFile]"; exit 1; }
+
+ContainerTag="${2:-latest}"
+
+Namespace="l3ft"
+BuildArchs=("x86_64" "aarch64")
+BuildArm="pluto"
+BuildParms=("compress" "force-rm")
+
+Image="$Namespace/$Container:$ContainerTag"
+
+docker login
+
+for arch in ${BuildArchs[@]}; do
+
+  buildTags=("$Image")
+  [[ ${#BuildArchs[@]} -gt 1 ]] && buildTags+=("$Image-$arch")
+
+  unset DOCKER_HOST
+  [[ $arch =~ ^(arm|aarch) && ! $BuildArm = "local" ]] \
+    && export DOCKER_HOST="ssh://$BuildArm"
+
+  buildArgs=("ARCH=$arch")
+
+  docker build ${buildTags[@]/#/-t } ${buildArgs[@]/#/--build-arg } \
+    ${BuildParms[@]/#/--} \
+    ${ContainerFile%/*}
+
+  docker push "${buildTags[-1]}"
+done
+
+[[ ${#BuildArchs[@]} -gt 1 ]] && {
+  docker manifest create "$Image" \
+    ${BuildArchs[@]/#/--amend $Image-}
+  docker manifest push "$Image"
+}
+
+exit
