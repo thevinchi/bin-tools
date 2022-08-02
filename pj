@@ -688,6 +688,7 @@ makeTemplate() {
   cp $PWD/$file $PWD/$template
 
   tagFile $PWD/$template "{{Namespace}}" "$Namespace"
+  # tagFile $PWD/$template "{{VersionZip}}" "${Version//./}"
 
   return
 }
@@ -716,13 +717,13 @@ deployStack () {
     --stack-name "$stack" \
     --template-file stack.template \
     --capabilities CAPABILITY_IAM CAPABILITY_AUTO_EXPAND \
-    --parameter-overrides ${parameters[@]}
-  rC=$?
+    --parameter-overrides ${parameters[@]} \
+  && rC=$?|| rC=$?
 
   rm stack.template
 
   [[ $rC -ne 0 ]] && {
-    printf "\nerror!\n\nCaught exit with code:[$?]\n"
+    printf "\nerror!\n\nCaught exit with code:[$rC]\n"
     return 1
   }
   printf -- "- Deployment Complete! (v$Version)\n\n"
@@ -767,13 +768,13 @@ updateStack () {
     --stack-name "$stack" \
     --template-file stack.template \
     --capabilities CAPABILITY_IAM CAPABILITY_AUTO_EXPAND \
-    --parameter-overrides ${parameters[@]}
-  rC=$?
+    --parameter-overrides ${parameters[@]} \
+  && rC=$?|| rC=$?
 
   rm stack.template
 
   [[ $rC -ne 0 ]] && {
-    printf "\nerror!\n\nCaught exit with code:[$?]\n"
+    printf "\nerror!\n\nCaught exit with code:[$rC]\n"
     return 1
   }
   printf -- "- Update Complete! (v$Version)\n\n"
