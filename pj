@@ -635,10 +635,10 @@ makeParameters() {
       | to_entries
       | map(
           (
-            if (.value|type) != "array" then
-              .value
+            if .value|type|inside("array|object") then
+              .value|tojson
             else
-              (.value|join(","))
+              .value
             end
           ) as $param
           |
@@ -653,10 +653,10 @@ makeParameters() {
       | to_entries
       | map(
           (
-            if (.value|type) != "array" then
-              .value
+            if .value|type|inside("array|object") then
+              .value|tojson
             else
-              (.value|join(","))
+              .value
             end
           ) as $param
           |
