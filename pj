@@ -152,27 +152,44 @@ publishBucket() {
   [[ $region == "root" ]] && {
 
     declare \
-      packages=() \
+      bundles=() \
       excludes=(".DS_Store") \
-      folder package
+      packages=() \
+      folder bundle package url
 
     for folder in ./buckets/$bucket/*/; do
       project \
         --arg b "$bucket" \
         --arg f "$(basename $folder)" \
-        ' as {publish:{buckets:{($b):{packages:$p}}}}?//$x|$p//[]|index($f)' \
+        ' as {publish:{buckets:{($b):{bundles:$p}}}}?//$x|$p//[]|index($f)' \
         1> /dev/null \
       || continue
 
-      package="$(basename $folder).tgz"
+      bundle="$(basename $folder).tgz"
 
-      printf -- "- Packaging folder:[$folder] as package:[$package]\n"
-      (cd "${folder}../" && tar -czf "$package" "${package%.*}/")
-      packages+=("$(dirname $folder)/$package")
+      printf -- "- Bundling folder:[$folder] as bundle:[$bundle]\n"
+      (cd "${folder}../" && tar -czf "$bundle" "${bundle%.*}/")
+      bundles+=("$(dirname $folder)/$bundle")
 
       exclude="${folder#*/}" && exclude=${exclude%/*}
       excludes+=(${folder#*/}*)
     done
+
+    packages=($(project \
+      --arg b "$bucket" \
+      ' as {publish:{buckets:{($b):{packages:$p}}}}?//$x|$p//{}|keys[]'))
+    [[ ${#packages} -gt 0 ]] && {
+      folder="./buckets/$bucket/packages"
+      mkdir -p "$folder"
+      for package in ${packages[@]}; do
+        printf -- "- Downloading package:[$package] to folder:[$folder]\n"
+        url=$(project \
+          --arg b "$bucket" \
+          --arg p "$package" \
+          'publish.buckets[$b].packages[$p]')
+        curl -L -o $folder/$package $url
+      done
+    }
 
     src="./buckets/$bucket/"
     dst="$prefix-$bucket"
@@ -180,8 +197,10 @@ publishBucket() {
     $Aws s3 sync "$src" "s3://$dst" --delete ${excludes[@]/#/--exclude }
     printf "\n"
 
-    [[ ${#packages} -ne 0 ]] && \
-      for package in ${packages[@]}; do rm $package; done
+    [[ ${#bundles} -ne 0 ]] && \
+      for bundle in ${bundles[@]}; do rm $bundle; done
+
+    [[ ${#packages} -gt 0 ]] && rm -Rf "./buckets/$bucket/packages"
 
     return
   }
