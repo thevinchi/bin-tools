@@ -861,10 +861,10 @@ declare -A Regions \
   case $Region in
     'all')
       printf "\nStarting synchronous execution for ALL regions\n\n"
-      $0 "$Action" "root" "$Config" && {
+      $0 $Action --region=root --config="$Config" && {
         for region in ${Regions[all]}; do
           [[ $region = ${Regions[root]} ]] && continue
-          $0 "$Action" "$region" "$Config" || ! break
+          $0 $Action --region=$region --config=$Config || ! break
         done
       }
       exit
