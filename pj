@@ -3,8 +3,7 @@
 
 set \
   -o errexit \
-  -o pipefail \
-  -o nounset
+  -o pipefail
 
 showHelp() {
   printf "\nusage: ./pj "
@@ -100,7 +99,26 @@ project() {
   return $rC
 }
 
-tagFile(){ local t=$(cat $1); echo "${t//$2/$3}" > $1; }
+tagFile() {
+  declare t=$(cat "$1")
+  echo "${t//$2/$3}" > "$1"
+}
+
+makeTemplate() {
+  declare \
+    file=$1 \
+    template=$2 \
+    version
+
+  cp $file $template
+
+  tagFile $template "{{Version}}" "$Version"
+  #tagFile $template "{{VersionZip}}" "${Version//./}"
+  tagFile $template "{{Project}}" "${Name}"
+  tagFile $template "{{Namespace}}" "$Namespace"
+
+  return
+}
 
 # Bucket Management (S3)
 ################################################################################
@@ -110,7 +128,7 @@ createBucket() {
     bucket="$2"
 
   declare \
-    prefix="$Namespace-$Name" \
+    prefix="${Namespace,,}-${Name,,}" \
     constraint="$region" 
 
   bucket="$prefix-$bucket"
@@ -146,22 +164,55 @@ publishBucket() {
     bucket="$2"
 
   declare \
-    prefix="$Namespace-$Name" \
+    prefix="${Namespace,,}-${Name,,}" \
     src dst
 
   [[ $region == "root" ]] && {
 
     declare \
+      templates=() \
       bundles=() \
-      excludes=(".DS_Store") \
       packages=() \
-      folder bundle package url
+      excludes=(".DS_Store") \
+      file template tags tag folder bundle package url
 
+    project --arg b "$bucket" 'publish.buckets[$b]' 1>/dev/null \
+    && \
+    project --arg b "$bucket" 'publish.buckets[$b]["templates"]' 1>/dev/null \
+    && {
+      printf -- "- Creating templates for bucket:[$bucket]\n"
+
+      tags=$(project --arg b "$bucket" 'publish.buckets[$b]["templates"]')
+      [[ $tags != 'true' ]] \
+        && tags=($(project --arg b "$bucket" \
+          'publish.buckets[$b]["templates"][]')) \
+        || unset tags
+
+      for file in $(find ./buckets/$bucket/ -type f); do
+        template=${file##*/} \
+          && template="${file%/*}/${template%.*}.template"
+        makeTemplate "$file" "$template"
+
+        [[ ${#tags[@]} -gt 0 ]] \
+          && for tag in ${tags[@]}; do
+            tagFile "$template" "{{${tag%%=*}}}" "$(project ${tag#*=})"
+          done
+
+        templates+=("$template")
+        excludes+=("$file")
+      done
+    }
+
+    project --arg b "$bucket" 'publish.buckets[$b]' 1> /dev/null \
+    && \
+    project --arg b "$bucket" 'publish.buckets[$b]["bundles"]' 1>/dev/null \
+    && \
     for folder in ./buckets/$bucket/*/; do
+
       project \
         --arg b "$bucket" \
         --arg f "$(basename $folder)" \
-        ' as {publish:{buckets:{($b):{bundles:$p}}}}?//$x|$p//[]|index($f)' \
+        'publish.buckets[$b].bundles|index($f)' \
         1> /dev/null \
       || continue
 
@@ -175,34 +226,68 @@ publishBucket() {
       excludes+=(${folder#*/}*)
     done
 
-    packages=($(project \
-      --arg b "$bucket" \
-      ' as {publish:{buckets:{($b):{packages:$p}}}}?//$x|$p//{}|keys[]'))
-    [[ ${#packages} -gt 0 ]] && {
-      folder="./buckets/$bucket/packages"
-      mkdir -p "$folder"
-      for package in ${packages[@]}; do
-        printf -- "- Downloading package:[$package] to folder:[$folder]\n"
-        url=$(project \
-          --arg b "$bucket" \
-          --arg p "$package" \
-          'publish.buckets[$b].packages[$p]')
-        curl -L -o $folder/$package $url
-      done
+    project --arg b "$bucket" 'publish.buckets[$b]' 1> /dev/null \
+    && \
+    project --arg b "$bucket" 'publish.buckets[$b]["packages"]' 1>/dev/null \
+    && {
+      packages=($(project \
+        --arg b "$bucket" \
+        'publish.buckets[$b].packages|keys[]'))
+      [[ ${#packages} -gt 0 ]] && {
+        folder="./buckets/$bucket/packages"
+        mkdir -p "$folder"
+        for package in ${packages[@]}; do
+          printf -- "- Downloading package:[$package] to folder:[$folder]\n"
+          url=$(project \
+            --arg b "$bucket" \
+            --arg p "$package" \
+            'publish.buckets[$b].packages[$p]')
+          curl -L -o $folder/$package $url
+        done
+      }
     }
 
     src="./buckets/$bucket/"
     dst="$prefix-$bucket"
+
+    project --arg b "$bucket" 'publish.buckets[$b]' 1> /dev/null \
+    && \
+    project --arg b "$bucket" 'publish.buckets[$b]["version"]' 1>/dev/null \
+    && {
+      declare version
+      version=$(project --arg b "$bucket" 'publish.buckets[$b]["version"]')
+      case $version in
+        'true') dst+="/$Version";;
+        'false') dst+='';;
+        *)
+          [[ $version != 'false' && ! $version =~ ^[0-9.]+$ ]] \
+            && version=$(project $version)
+
+          dst+="/$version"
+          ;;
+      esac
+    }
+
     printf -- "- Publishing folder:[$src] to bucket:[$dst]\n"
     $Aws s3 sync "$src" "s3://$dst" --delete ${excludes[@]/#/--exclude }
     printf "\n"
 
-    [[ ${#bundles} -ne 0 ]] && \
-      for bundle in ${bundles[@]}; do rm $bundle; done
+    [[ ${#bundles} -ne 0 ]] \
+      && {
+        for bundle in ${bundles[@]}; do rm $bundle; done
+      }
 
-    [[ ${#packages} -gt 0 ]] && rm -Rf "./buckets/$bucket/packages"
+    [[ ${#packages} -gt 0 ]] \
+      && {
+        rm -Rf "./buckets/$bucket/packages"
+      }
 
-    return
+    [[ ${#templates} -gt 0 ]] \
+      && {
+        for template in ${templates[@]}; do rm $template; done
+      }
+
+    return 0
   }
 
   src="$prefix-$bucket"
@@ -236,7 +321,7 @@ destroyBucket() {
     bucket="$2"
 
   declare \
-    prefix="$Namespace-$Name" \
+    prefix="${Namespace,,}-${Name,,}" \
     constraint="$region" 
 
   bucket="$prefix-$bucket"
@@ -640,8 +725,8 @@ makeParameters() {
   declare \
     parameters=(
       "Version=$Version"
-      "Namespace=$Namespace"
       "Name=$Name"
+      "Namespace=$Namespace"
       "RegionsRoot=${Regions[root]}"
     )
 
@@ -699,19 +784,6 @@ makeParameters() {
   return
 }
 
-makeTemplate() {
-  declare \
-    file=$1 \
-    template=${1%%.*}.template
-
-  cp $PWD/$file $PWD/$template
-
-  tagFile $PWD/$template "{{Namespace}}" "$Namespace"
-  # tagFile $PWD/$template "{{VersionZip}}" "${Version//./}"
-
-  return
-}
-
 deployStack () {
   printf "Deploying [$Namespace/$Name] in [$Account/${Regions[run]}]\n"
 
@@ -721,14 +793,20 @@ deployStack () {
 
   parameters+=($(makeParameters)) || return
 
+  makeTemplate "$PWD/stack.yml" "$PWD/stack.template"
+
   declare bucket=""
   [[ -d $PWD/buckets && $(project publish.buckets) != "false" ]] && {
-    declare buckets=( $(ls buckets/) )
-    bucket="$Namespace-$Name-${buckets[0]}-${Regions[run]}"
-    bucket="--s3-bucket $bucket --s3-prefix templates"
-  }
 
-  makeTemplate "stack.yml"
+    [[ -d $PWD/buckets/templates ]] \
+      && bucket="${Namespace,,}-${Name,,}-templates-${Regions[run]}" \
+      || {
+        declare buckets=( $(ls buckets/) )
+        bucket="${Namespace,,}-${Name,,}-${buckets[0]}-${Regions[run]}"
+      }
+
+    bucket="--s3-bucket $bucket --s3-prefix $Version"
+  }
 
   printf -- "- Deploying CloudFormation stack:[$stack] ...\n"
   declare rC
@@ -737,9 +815,9 @@ deployStack () {
     --template-file stack.template \
     --capabilities CAPABILITY_IAM CAPABILITY_AUTO_EXPAND \
     --parameter-overrides ${parameters[@]} \
-  && rC=$?|| rC=$?
+  && rC=$? || rC=$?
 
-  rm stack.template
+  rm "$PWD/stack.template"
 
   [[ $rC -ne 0 ]] && {
     printf "\nerror!\n\nCaught exit with code:[$rC]\n"
@@ -772,14 +850,20 @@ updateStack () {
 
   parameters+=($(makeParameters)) || return
 
+  makeTemplate "$PWD/stack.yml" "$PWD/stack.template"
+
   declare bucket=""
   [[ -d $PWD/buckets && $(project publish.buckets) != "false" ]] && {
-    declare buckets=( $(ls buckets/) )
-    bucket="$Namespace-$Name-${buckets[0]}-${Regions[run]}"
-    bucket="--s3-bucket $bucket --s3-prefix templates"
-  }
 
-  makeTemplate "stack.yml"
+    [[ -d $PWD/buckets/templates ]] \
+      && bucket="$Namespace-$Name-templates-${Regions[run]}" \
+      || {
+        declare buckets=( $(ls buckets/) )
+        bucket="$Namespace-$Name-${buckets[0]}-${Regions[run]}"
+      }
+
+    bucket="--s3-bucket $bucket --s3-prefix $Version"
+  }
 
   printf -- "- Updating CloudFormation stack:[$stack] ...\n"
   declare rC
@@ -788,9 +872,9 @@ updateStack () {
     --template-file stack.template \
     --capabilities CAPABILITY_IAM CAPABILITY_AUTO_EXPAND \
     --parameter-overrides ${parameters[@]} \
-  && rC=$?|| rC=$?
+  && rC=$? || rC=$?
 
-  rm stack.template
+  rm "$PWD/stack.template"
 
   [[ $rC -ne 0 ]] && {
     printf "\nerror!\n\nCaught exit with code:[$rC]\n"
@@ -840,12 +924,12 @@ cleanStack () {
 ################################################################################
 parseOptions "${@:2}" \
   && Version="$(project version)" \
-  && Account="$(project account)" \
-  && Namespace="$(project namespace)" \
   && Name="$(project name)" \
+  && Namespace="$(project namespace)" \
   && {
     Domain="$(project domain)" || unset Domain
   } \
+  && Account="$(project account)" \
   || { echo "Invalid config:[$Config]"; exit 1; }
 
 declare -A Regions \
