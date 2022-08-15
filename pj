@@ -176,9 +176,9 @@ publishBucket() {
       excludes=(".DS_Store") \
       file template tags tag folder bundle package url
 
-    project --arg b "$bucket" 'publish.buckets[$b]' 1>/dev/null \
+    project --arg b "$bucket" 'publish.buckets[$b]' &> /dev/null \
     && \
-    project --arg b "$bucket" 'publish.buckets[$b]["templates"]' 1>/dev/null \
+    project --arg b "$bucket" 'publish.buckets[$b]["templates"]' &> /dev/null \
     && {
       printf -- "- Creating templates for bucket:[$bucket]\n"
 
@@ -203,9 +203,9 @@ publishBucket() {
       done
     }
 
-    project --arg b "$bucket" 'publish.buckets[$b]' 1> /dev/null \
+    project --arg b "$bucket" 'publish.buckets[$b]' &> /dev/null \
     && \
-    project --arg b "$bucket" 'publish.buckets[$b]["bundles"]' 1>/dev/null \
+    project --arg b "$bucket" 'publish.buckets[$b]["bundles"]' &> /dev/null \
     && \
     for folder in ./buckets/$bucket/*/; do
 
@@ -226,9 +226,9 @@ publishBucket() {
       excludes+=(${folder#*/}*)
     done
 
-    project --arg b "$bucket" 'publish.buckets[$b]' 1> /dev/null \
+    project --arg b "$bucket" 'publish.buckets[$b]' &> /dev/null \
     && \
-    project --arg b "$bucket" 'publish.buckets[$b]["packages"]' 1>/dev/null \
+    project --arg b "$bucket" 'publish.buckets[$b]["packages"]' &> /dev/null \
     && {
       packages=($(project \
         --arg b "$bucket" \
@@ -250,9 +250,9 @@ publishBucket() {
     src="./buckets/$bucket/"
     dst="$prefix-$bucket"
 
-    project --arg b "$bucket" 'publish.buckets[$b]' 1> /dev/null \
+    project --arg b "$bucket" 'publish.buckets[$b]' &> /dev/null \
     && \
-    project --arg b "$bucket" 'publish.buckets[$b]["version"]' 1>/dev/null \
+    project --arg b "$bucket" 'publish.buckets[$b]["version"]' &> /dev/null \
     && {
       declare version
       version=$(project --arg b "$bucket" 'publish.buckets[$b]["version"]')
@@ -403,22 +403,92 @@ destroyBuckets() {
 
 # Container Management
 ################################################################################
+buildContainer() {
+  declare \
+    container="$1" \
+    image="$2" \
+    folder="$3"
+
+  declare -A archs
+
+  project --arg c "$container" 'publish.containers[$c]' &> /dev/null \
+  && \
+  project --arg c "$container" \
+    'publish.containers[$c]["architectures"]' &> /dev/null \
+  && {
+    declare arch
+    for arch in $(project --arg c "$container" \
+      'publish.containers[$c].architectures[]'); \
+    do
+      archs[$arch]=$(project --arg a $arch \
+        'publish.containers.architectures[$a]')
+    done
+  }
+
+  [[ ${#archs[@]} -eq 0 ]] && {
+    project 'publish.containers["architectures"]' &> /dev/null \
+    && {
+      for arch in $(project 'publish.containers.architectures|keys[]'); do
+        archs[$arch]=$(project --arg a $arch \
+          'publish.containers.architectures[$a]')
+      done
+    } \
+    || archs[x86_64]="local"
+  }
+
+  declare arch host tags args builder
+  for arch in ${!archs[@]}; do
+    printf -- "- Building container image:[$image] for arch:[$arch]"
+
+    host="${archs[$arch]}"
+    unset DOCKER_HOST
+    [[ $host != "local" ]] && {
+      printf " on host:[$host]"
+      export DOCKER_HOST="ssh://$host"
+    }
+
+    builder="$Docker build $DockerBuildFlags"
+
+    tags=("$image")
+    [[ ${#archs[@]} -gt 1 ]] && tags+=("$image-$arch")
+
+    args=("ARCH=$arch")
+
+    builder+=" ${tags[@]/#/-t } ${args[@]/#/--build-arg } $folder"
+    [[ -z $Container ]] && {
+      printf "..."
+      $builder &> /dev/null \
+      || {
+        printf "error!\n\nTry building directly with:\n$builder\n\n"
+        ! break
+      }
+      printf "done!\n"
+    } || {
+      printf "\n"
+      $builder \
+      || {
+        printf "error!\n\nTry building directly with:\n$builder\n\n"
+        ! break
+      }
+    }
+  done
+
+  unset DOCKER_HOST
+
+  return
+}
+
 buildContainers() {
   declare \
-    folder image builder
+    folder container image builder
 
   [[ -d $PWD/containers ]] || return 0
 
   [[ -z $Container ]] && {
     for folder in $PWD/containers/*/; do
-      image="$Namespace/$(basename $folder):$Version"
-      builder="$Docker build $DockerBuildFlags -t $image $folder"
-      printf -- "- Building container image:[$image] ... "
-      $builder &> /dev/null || {
-        printf "error!\n\nTry building directly with:\n$builder\n\n"
-        ! break
-      }
-      printf "done!\n"
+      container="$(basename $folder)"
+      image="$Namespace/$container:$Version"
+      buildContainer "$container" "$image" "$folder"
     done
   }
 
@@ -430,9 +500,7 @@ buildContainers() {
     }
 
     image="$Namespace/$Container:$Version"
-    builder="$Docker build $DockerBuildFlags -t $image $folder"
-    printf -- "- Building container image:[$image] ... \n"
-    $builder
+    buildContainer "$Container" "$image" "$folder"
   }
 
   return 0
@@ -467,6 +535,84 @@ deleteContainerRepo() {
   return
 }
 
+publishContainer() {
+  declare \
+    container="$1" \
+    image="$2" \
+    repo="$3"
+
+  declare -A archs
+
+  project --arg c "$container" 'publish.containers[$c]' &> /dev/null \
+  && \
+  project --arg c "$container" \
+    'publish.containers[$c]["architectures"]' &> /dev/null \
+  && {
+    declare arch
+    for arch in $(project --arg c "$container" \
+      'publish.containers[$c].architectures[]'); \
+    do
+      archs[$arch]=$(project --arg a $arch \
+        'publish.containers.architectures[$a]')
+    done
+  }
+
+  [[ ${#archs[@]} -eq 0 ]] && {
+    project 'publish.containers["architectures"]' &> /dev/null \
+    && {
+      for arch in $(project 'publish.containers.architectures|keys[]'); do
+        archs[$arch]=$(project --arg a $arch \
+          'publish.containers.architectures[$a]')
+      done
+    } \
+    || archs[x86_64]="local"
+  }
+
+  declare arch host tag manifest=()
+  for arch in ${!archs[@]}; do
+    printf -- "- Publishing container image:[$image] with arch:[$arch]"
+
+    host="${archs[$arch]}"
+    unset DOCKER_HOST
+    [[ $host != "local" ]] && {
+      printf " from host:[$host]"
+      export DOCKER_HOST="ssh://$host"
+    }
+
+    tag="$image"
+    [[ ${#archs[@]} -gt 1 ]] && {
+      tag+="-$arch"
+      manifest+=("$repo/$tag")
+    }
+
+    printf "\n"
+
+    $Docker tag $tag $repo/$tag \
+      && $Docker push $repo/$tag
+    rC=$?
+
+    $Docker image rm $repo/$tag &> /dev/null
+    [[ $rC -eq 0 ]] || ! break
+
+    printf "\n"
+  done
+
+  unset DOCKER_HOST
+
+  [[ ${#archs[@]} -gt 1 ]] && {
+    docker manifest create "$repo/$image" ${manifest[@]/#/--amend }
+    for arch in ${!archs[@]}; do
+      [[ $arch == "x86_64" ]] && continue
+      docker manifest annotate --arch $arch "$repo/$image" "$repo/$image-$arch"
+    done
+    docker manifest push "$repo/$image"
+    docker manifest rm "$repo/$image"
+  }
+
+  printf "done!\n"
+  return
+}
+
 publishContainers() {
   local \
     region="${Regions[run]}"
@@ -488,30 +634,27 @@ publishContainers() {
     | $Docker login --username AWS --password-stdin $repo 2>&1) \
     || { printf "error!\n\n$login\n"; return 1; }
 
-  declare folder container image rC
+  declare folder container image
   for folder in $PWD/containers/*/; do
     container="$(basename $folder)"
-    image="$Namespace/$container"
+    image="$Namespace/$container:$Version"
 
-    [[ $(project \
-      --arg c "$container" \
-      ' as {publish:{containers:{($c):$p}}}?//$x | $p == false') \
-    ]] \
-      && { printf -- "- Skipping container:[$container] ...\n"; continue; }
-
-    $Aws ecr describe-repositories --repository-names $image &> /dev/null || {
-      createContainerRepo "$image" || ! break
+    project --arg c "$container" 'publish.containers[$c]' &> /dev/null \
+    && \
+    project --arg c "$container" 'publish.containers[$c]==false' &> /dev/null \
+    && {
+      printf -- "- Skipping container:[$container] ...\n"
+      continue
     }
 
-    printf -- "- Publishing image:[$image] to repo:[$repo] ...\n\n"
-    $Docker tag $image:$Version $repo/$image:$Version \
-      && $Docker push $repo/$image:$Version
-    rC=$?
+    $Aws ecr describe-repositories \
+      --repository-names "$Namespace/$container" &> /dev/null \
+    || {
+      createContainerRepo "$Namespace/$container" \
+        || ! break
+    }
 
-    $Docker image rm $repo/$image:$Version &> /dev/null
-    [[ $rC -eq 0 ]] || ! break
-
-    printf "\n"
+    publishContainer "$container" "$image" "$repo"
   done
 
   return
