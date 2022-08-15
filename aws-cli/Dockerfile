@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1.3-labs
-FROM ubuntu:20.04
+FROM ubuntu:22.04
 
 ADD "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" awscliv2.zip
 
