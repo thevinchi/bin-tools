@@ -1122,6 +1122,7 @@ case $Action in
   'build') buildStack;;
   'publish') publishStack;;
   'deploy') deployStack;;
+  'push') buildStack && publishStack && deployStack;;
   'start'|'stop') updateStack;;
   'destroy') destroyStack;;
   'clean') cleanStack;;

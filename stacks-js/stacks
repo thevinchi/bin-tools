@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+[ ${BASH_VERSION%%.*} -lt 4 ] && { echo "Requires bash 4+"; exit 1; }
+
+Depends=("docker")
+for d in ${Depends[@]}; do
+  [[ $(which $d) ]] || { echo "Missing dependency: $d"; ! break; }
+done || exit
+
+DockerImage="stacks-js:local"
+
+export DOCKER_BUILDKIT=1
+Docker="$(which docker)"
+
+$Docker inspect $DockerImage &> /dev/null || {
+  DockerImageRoot="$(dirname "$(readlink -f "$0")")"
+  printf "\nDocker image:[$DockerImage] missing\n\n"
+  printf "Building docker image:[$DockerImage] from:[$DockerImageRoot] ...\n\n"
+  $Docker build --network=host -t $DockerImage $DockerImageRoot/ \
+  || exit
+}
+
+Docker="$Docker run --rm -i --network=host"
+[[ $1 = "bash" ]] && Docker="$Docker -t"
+
+DockerVolumes=( "$PWD:/app" )
+#[[ ! -d "$HOME/.aws" ]] && { mkdir -p "$HOME/.aws"; chmod 700 "$HOME/.aws"; }
+
+$Docker ${DockerVolumes[@]/#/-v } $DockerImage "$@"
+# case $1 in
+#   'bash') $Docker ${DockerVolumes[@]/#/-v } -t $DockerImage "$@" || exit;;
+#   *) $Docker ${DockerVolumes[@]/#/-v } $DockerImage "$@" || exit;;
+# esac
+
+exit

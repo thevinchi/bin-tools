@@ -1,0 +1,937 @@
+#!/usr/bin/env bash
+[ ${BASH_VERSION%%.*} -lt 4 ] && { echo "Requires bash 4+"; exit 1; }
+
+set \
+  -o noclobber \
+  -o errexit \
+  -o pipefail \
+  -o nounset
+
+showHelp() {
+  printf "\nusage: ./pj "
+  printf "<action:build|publish|deploy|start|stop|destroy|clean|list> "
+  printf "<region:[root]>"
+  printf "<config:[config.json]>"
+  printf "\n\n"
+}
+[[ $# -eq 0 ]] && { showHelp; exit 1; }
+
+Action="$1"
+Region=${2:-"root"}
+Config=${3:-"./config.json"}
+
+# Dependencies
+################################################################################
+Depends=("aws" "jq" "docker" "docker-compose")
+for d in ${Depends[@]}; do
+  [[ $(which $d) ]] || { echo "Missing dependency: $d"; ! break; }
+done || exit
+
+export DOCKER_BUILDKIT=1
+Docker="$(which docker)"
+DockerBuildFlags="--force-rm --compress"
+
+# Helpers
+################################################################################
+project() {
+  local \
+    file="$Config"
+
+  [[ -r $file ]] || { echo "Missing project config file:[$file]"; return 1; }
+  [[ $1 = "echo" ]] && { cat "$file" | jq -e '.'; return; }
+
+  declare args=("$@") result rC
+  [[ ${#args[@]} -gt 1 ]] && {
+    result=$(cat "$file"|jq -rce ${args[@]:0:${#args[@]} - 1} ".${args[-1]}") \
+      || return
+  } \
+  || result=$(cat "$file" | jq -rce ".${@}")
+
+  rC=$?
+  [[ ! $result =~ null|'{}'|'[]' ]] && echo $result
+
+  return $rC
+}
+
+# Bucket Management
+################################################################################
+createBucket() {
+  local \
+    region="$1" \
+    bucket="$2"
+
+  declare \
+    prefix="$Namespace-$Name" \
+    constraint="$region" 
+
+  bucket="$prefix-$bucket"
+
+  [[ $region == "root" ]] \
+    && constraint="${Regions[root]}" \
+    || bucket+="-$region" 
+
+  printf -- "- Creating bucket:[$bucket] ... "
+
+  fetchBucket "$bucket" &> /dev/null && {
+    printf "exists\n"
+    return
+  }
+
+  [[ $region != "us-east-1" ]] \
+  && constraint="--create-bucket-configuration LocationConstraint=$constraint" \
+  || constraint=""
+
+  declare result
+  result=$($Aws s3api create-bucket $constraint \
+    --bucket "$bucket" \
+    --acl private) \
+  || { printf "error!\n\n$result\n"; return 1; }
+
+  printf "done!\n"
+  return
+}
+
+publishBucket() {
+  local \
+    region="$1" \
+    bucket="$2"
+
+  declare \
+    prefix="$Namespace-$Name" \
+    src dst
+
+  [[ $region == "root" ]] && {
+
+    declare \
+      packages=() \
+      excludes=(".DS_Store") \
+      folder package
+
+    for folder in ./buckets/$bucket/*/; do
+      project \
+        --arg b "$bucket" \
+        --arg f "$(basename $folder)" \
+        ' as {publish:{buckets:{($b):{packages:$p}}}}?//$x|$p//[]|index($f)' \
+        1> /dev/null \
+      || continue
+
+      package="$(basename $folder).tgz"
+
+      printf -- "- Packaging folder:[$folder] as package:[$package]\n"
+      (cd "${folder}../" && tar -czf "$package" "${package%.*}/")
+      packages+=("$(dirname $folder)/$package")
+      excludes+=("$(basename $folder)/*")
+    done
+
+    src="./buckets/$bucket/"
+    dst="$prefix-$bucket"
+    printf -- "- Publishing folder:[$src] to bucket:[$dst]\n"
+    $Aws s3 sync "$src" "s3://$dst" --delete ${excludes[@]/#/--exclude }
+    printf "\n"
+
+    [[ ${#packages} -ne 0 ]] && \
+      for package in ${packages[@]}; do rm $package; done
+
+    return
+  }
+
+  src="$prefix-$bucket"
+  dst="$prefix-$bucket-$region"
+
+  printf -- "- Sync bucket:[$dst] from region:[${Regions[root]}]\n"
+  $Aws s3 sync "s3://$src" "s3://$dst" \
+    --source-region ${Regions[root]} \
+    --delete \
+    --exclude ".DS_Store"
+  printf "\n"
+
+  return
+}
+
+fetchBucket() {
+  local \
+    bucket="$1"
+
+  declare result
+  result=$($Aws s3api list-buckets \
+    | jq -e --arg b "$bucket" '.Buckets|map(select(.Name==$b))[]') \
+  || return
+
+  echo -n "$result"
+
+  return
+}
+
+destroyBucket() {
+  local \
+    region="$1" \
+    bucket="$2"
+
+  declare \
+    prefix="$Namespace-$Name" \
+    constraint="$region" 
+
+  bucket="$prefix-$bucket"
+
+  [[ $region == "root" ]] || bucket+="-$region" 
+
+  printf -- "- Destroying bucket:[$bucket] ... "
+
+  fetchBucket "$bucket" &> /dev/null || { printf "missing\n"; return; }
+
+  declare result
+  result=$($Aws s3 rm "s3://$bucket" --recursive) \
+  || { printf "error!\n\n$result\n"; return 1; }
+
+  result=$($Aws s3api delete-bucket --bucket "$bucket") \
+  || { printf "error!\n\n$result\n"; return 1; }
+
+  printf "done!\n"
+  return
+}
+
+publishBuckets() {
+
+  [[ -d $PWD/buckets && $(project publish.buckets) != "false" ]] || {
+    printf -- "- Skipping buckets ...\n"
+    return
+  }
+
+  declare folder bucket
+  for folder in $PWD/buckets/*/; do
+    bucket="$(basename $folder)"
+
+    [[ $(project \
+      --arg b "$bucket" \
+      ' as {publish:{buckets:{($b):$p}}}?//$x | $p == false') \
+    ]] \
+      && { printf -- "- Skipping bucket:[$bucket] ...\n"; continue; }
+
+    [[ ${Regions[run]} == ${Regions[root]} ]] && {
+      createBucket "root" "$bucket" \
+        && publishBucket "root" "$bucket" \
+        || ! break
+    }
+
+    createBucket "${Regions[run]}" "$bucket" \
+      && publishBucket "${Regions[run]}" "$bucket" \
+      || ! break
+  done
+
+  return
+}
+
+destroyBuckets() {
+
+  [[ -d $PWD/buckets && $(project destroy.buckets) != "false" ]] || {
+    printf -- "- Skipping buckets ...\n"
+    return
+  }
+
+  declare folder bucket
+  for folder in $PWD/buckets/*/; do
+    bucket="$(basename $folder)"
+
+    [[ $(project --arg b "$bucket" 'destroy.buckets[$b]') = "false" ]] \
+      && { printf -- "- Skipping bucket:[$bucket] ...\n"; continue; }
+
+    [[ ${Regions[run]} == ${Regions[root]} ]] && {
+      destroyBucket "root" "$bucket" || ! break
+    }
+
+    destroyBucket "${Regions[run]}" "$bucket" || ! break
+  done
+
+  return
+}
+
+# Container Management
+################################################################################
+buildContainers() {
+  declare \
+    folder image builder
+
+  [[ -d $PWD/containers ]] || return 0
+
+  for folder in $PWD/containers/*/; do
+    image="$Namespace/$(basename $folder)"
+    builder="$Docker build $DockerBuildFlags -t $image $folder"
+    printf -- "- Building container image:[$image] ... "
+    $builder &> /dev/null || {
+      printf "error!\n\nTry building directly with:\n$builder\n\n"
+      ! break
+    }
+    printf "done!\n"
+  done
+
+  return
+}
+
+createContainerRepo() {
+  local \
+    image="$1"
+
+  printf -- "- Creating repository for container:[$image] ... "
+  declare result
+  result=$($Aws ecr create-repository \
+    --repository-name "$image" \
+    --image-scanning-configuration "scanOnPush=true" \
+    --encryption-configuration "encryptionType=KMS") \
+  || { printf "error!\n\n$result\n"; return 1; }
+
+  printf "done!\n"
+  return
+}
+
+deleteContainerRepo() {
+  local \
+    image="$1"
+
+  printf -- "- Deleting repository for container:[$image] ... "
+  declare result
+  result=$($Aws ecr delete-repository --force --repository-name "$image") \
+  || { printf "error!\n\n$result\n"; return 1; }
+
+  printf "done!\n"
+  return
+}
+
+publishContainers() {
+  local \
+    region="${Regions[run]}"
+
+  declare \
+    account repo
+  
+  [[ -d $PWD/containers && $(project publish.containers) != "false" ]] || {
+    printf -- "- Skipping containers ...\n"
+    return
+  }
+
+  account="$($Aws sts get-caller-identity --output text --query 'Account')" \
+    && repo="$account.dkr.ecr.$region.amazonaws.com" \
+    || return
+
+  declare login
+  login=$($Aws ecr get-login-password --region $region \
+    | $Docker login --username AWS --password-stdin $repo 2>&1) \
+    || { printf "error!\n\n$login\n"; return 1; }
+
+  declare folder container image rC
+  for folder in $PWD/containers/*/; do
+    container="$(basename $folder)"
+    image="$Namespace/$container"
+
+    [[ $(project --arg c "$container" 'publish.containers[$c]') = "false" ]] \
+      && { printf -- "- Skipping container:[$container] ...\n"; continue; }
+
+    $Aws ecr describe-repositories --repository-names $image &> /dev/null || {
+      createContainerRepo "$image" || ! break
+    }
+
+    printf -- "- Publishing container:[$image] to repo:[$repo] ...\n\n"
+    $Docker tag $image:latest $repo/$image:latest \
+      && $Docker push $repo/$image:latest
+    rC=$?
+
+    $Docker image rm $repo/$image:latest &> /dev/null
+    [[ $rC -eq 0 ]] || ! break
+
+    printf "\n"
+  done
+
+  return
+}
+
+destroyContainers() {
+  declare \
+    folder container image cleaner
+
+  [[ -d $PWD/containers && $(project publish.containers) != "false" ]] || {
+    printf -- "- Skipping containers ...\n"
+    return
+  }
+
+  for folder in $PWD/containers/*/; do
+    container="$(basename $folder)"
+    image="$Namespace/$container"
+
+    [[ $(project --arg c "$container" 'publish.containers[$c]') = "false" ]] \
+      && { printf -- "- Skipping container:[$container] ...\n"; continue; }
+
+    $Aws ecr describe-repositories --repository-names $image &> /dev/null && {
+      deleteContainerRepo "$image" || ! break
+    }
+
+    printf "done!\n"
+  done
+
+  return
+}
+
+cleanContainers() {
+  declare \
+    folder image cleaner
+
+  [[ -d $PWD/containers ]] || return 0
+
+  for folder in $PWD/containers/*/; do
+    image="$Namespace/$(basename $folder)"
+    cleaner="$Docker rmi -f $($Docker images -a -q "$image")"
+
+    printf -- "- Removing container images:[$image:*] ... "
+    $cleaner &> /dev/null || {
+      printf "error!\n\nTry removing directly with:\n$cleaner\n\n"
+      ! break
+    }
+    printf "done!\n"
+  done
+
+  return
+}
+
+# Parameter Management
+################################################################################
+publishParameter() {
+  local \
+    key="$1"
+
+  declare \
+    path="${key%/*}" \
+    parameter="${key##*/}"
+
+  declare result
+  result=$($Aws ssm put-parameter \
+    --type "String" \
+    --name "$path/$parameter" \
+    --value "$(project \
+      --arg r "${Regions[run]}" \
+      --arg p "$parameter" \
+      '
+      | (.regions[$r]|.parameters//{}|.[$p]) as $regional
+      | (.parameters//{}|.[$p]) as $global
+      | $regional//$global')") \
+  || {
+    printf "error!\n\n$result\n"
+    return 1
+  }
+
+  return
+}
+
+fetchParameter() {
+  local \
+    key="$1"
+
+  declare \
+    path="${key%/*}" \
+    parameter="${key##*/}"
+
+  declare result
+  result=$($Aws ssm get-parameter \
+    --output text \
+    --name "$path/$parameter" \
+    --query 'Parameter.Value' \
+  2> /dev/null)
+  case $? in
+    254|255) # ParameterNotFound
+      printf "fail!\n"
+      printf "\nERROR: No Key found!\n\n"
+      return 1
+      ;;
+
+    0) # ParameterFound
+      echo -n "$result"
+      ;;
+
+    *) # AWS Config Issue or other gremlins ...
+      printf "error!\n"
+      printf "\nERROR: Check your AWS CLI config, something isn't right.\n"
+      return 1
+      ;;
+  esac
+
+  return
+}
+
+deleteParameter() {
+  local \
+    key="$1"
+
+  declare \
+    path="${key%/*}" \
+    parameter="${key##*/}"
+
+  declare result
+  result=$($Aws ssm delete-parameter --name "$path/$parameter") || {
+    printf "error!\n\n$result\n"
+    return 1
+  }
+
+  return
+}
+
+publishParameters() {
+  declare \
+    -A parameters
+  parameters[0]="bash-workaround"
+
+  declare \
+    parameter \
+    path="/$Namespace/$Project/globals"
+
+  [[ $(project parameters) ]] && {
+    for parameter in $(project 'parameters|keys|.[]'); do
+      parameters[$parameter]=$(project --arg p "$parameter" 'parameters[$p]')
+    done
+  }
+
+  [[ $(project --arg r "${Regions[run]}" 'regions[$r].parameters') ]] && {
+    for parameter in $(project \
+      --arg r "${Regions[run]}" \
+      'regions[$r].parameters|keys|.[]')
+    do
+      parameters[$parameter]=$(project \
+        --arg r "${Regions[run]}" \
+        --arg p "$parameter" \
+        'regions[$r].parameters[$p]')
+    done
+  }
+
+  [[ ${#parameters[@]} -ne 1 ]] || { echo "- Skipping parameters"; return; }
+
+  declare result
+  for parameter in ${!parameters[@]}; do
+    [[ ${parameters[$parameter]} = "bash-workaround" ]] && continue
+
+    printf -- "- Publishing parameter:[$parameter] ... "
+
+    fetchParameter "$path/$parameter" &> /dev/null && {
+      printf -- "exists\n"
+      continue
+    }
+
+    result=$(publishParameter "$path/$parameter") || {
+      printf "$result"
+      ! break
+    }
+
+    printf "done\n"
+  done
+
+  return
+}
+
+destroyParameters() {
+  declare \
+    parameters=() \
+    path="/$Namespace/$Project"
+
+  parameters=($($Aws ssm get-parameters-by-path \
+    --recursive \
+    --path "$path" \
+    | jq -rce '.Parameters[]|.Name'))
+
+  [[ $? -ne 0 || ${#parameters[@]} -eq 0 ]] \
+    && { echo "- No parameters found with path:[$path]"; return; }
+
+  declare parameter result
+  for parameter in ${parameters[@]}; do
+    printf -- "- Deleting parameter:[$parameter] ... "
+    fetchParameter "$parameter" &> /dev/null || {
+      printf -- "missing\n"
+      continue
+    }
+
+    result=$(deleteParameter "$parameter") || {
+      printf "$result"
+      ! break
+    }
+
+    printf "done\n"
+  done
+
+  return
+}
+
+# Secret Management
+################################################################################
+publishSecret() {
+  local \
+    key="$1"
+
+  declare path="/$Namespace/$Project/secrets/$key"
+
+  declare secret
+  secret="$(project --arg k "$key" 'secrets[$k]//"init"')"
+
+  declare result
+  result=$($Aws ssm put-parameter --name "$path" --value "$secret" \
+    --type "SecretString" \
+    --no-overwrite) \
+  || { printf "error!\n\n$result\n"; return 1; }
+
+  return
+}
+
+fetchSecret() {
+  local \
+    key="$1"
+
+  declare path="/$Namespace/$Project/secrets/$key"
+
+  declare result
+  result=$($Aws ssm get-parameter --name "$path" \
+    --with-decryption \
+    --output text \
+    --query 'Parameter.Value' \
+  2> /dev/null)
+  case $? in
+    254|255) # ParameterNotFound
+      printf "fail!\n"
+      printf "\nERROR: No Key found!\n\n"
+      return 1
+      ;;
+
+    0) # ParameterFound
+      echo -n "$result"
+      ;;
+
+    *) # AWS Config Issue or other gremlins ...
+      printf "error!\n"
+      printf "\nERROR: Check your AWS CLI config, something isn't right.\n"
+      return 1
+      ;;
+  esac
+
+  return
+}
+
+deleteSecret() {
+  local \
+    key="$1"
+
+  declare path="/$Namespace/$Project/secret/$key"
+
+  declare result
+  result=$($Aws ssm delete-parameter --name "$path") || {
+    printf "error!\n\n$result\n"
+    return 1
+  }
+
+  return
+}
+
+publishSecrets() {
+  declare \
+    secrets
+
+  [[ $(project secrets) ]] || { echo "- Skipping secrets"; return; }
+
+  secrets=($(project 'secrets|keys|.[]'))
+
+  declare secret result
+  for secret in ${secrets[@]}; do
+    printf -- "- Publishing secret:[$secret] ... "
+
+    [[ $(fetchSecret "$secret") ]] && {
+      printf -- "exists\n"
+      continue
+    }
+
+    result=$(publishSecret "$secret") || {
+      printf "$result"
+      ! break
+    }
+
+    printf "done\n"
+  done
+
+  return
+}
+
+destroySecrets() {
+  declare \
+    secrets
+
+  [[ $(project secrets) ]] || return 0
+
+  secrets=($(project 'secrets|keys|.[]'))
+
+  declare secret result
+  for secret in ${secrets[@]}; do
+    printf -- "- Deleting secret:[$secret] ... "
+
+    fetchSecret "$secret" &> /dev/null || {
+      printf -- "missing\n"
+      continue
+    }
+
+    result=$(deleteSecret "$secret") || {
+      printf "$result"
+      ! break
+    }
+
+    printf "done\n"
+  done
+
+  return
+}
+
+# Stack Management
+################################################################################
+buildStack () {
+  printf "Building [$Namespace/$Project]\n"
+
+  buildContainers
+
+  printf -- "- Build Complete!\n\n"
+
+  return
+}
+
+publishStack () {
+  printf "Publishing [$Namespace/$Project] to [$Account/${Regions[run]}]\n"
+
+  publishBuckets
+  publishContainers
+  publishParameters
+  publishSecrets
+
+  printf -- "- Publish Complete!\n\n"
+
+  return
+}
+
+makeParameters() {
+  declare \
+    parameters=(
+      "Account=$Account"
+      "Namespace=$Namespace"
+      "Name=$Name"
+      "Project=$Project"
+      "RegionsRoot=${Regions[root]}"
+    )
+
+  [[ -v Domain ]] && parameters+=("Domain=$Domain")
+
+  $(project --arg r "${Regions[run]}" 'regions[$r]|keys|length > 0') && {
+    parameters+=($(project \
+      --arg region "${Regions[run]}" \
+      'regions[$region]
+      | to_entries
+      | map("Region\(.key/""|first|=ascii_upcase|add)=\(.value)")
+      | .[]'))
+  }
+
+  # [[ $(project parameters) ]] && {
+  #   parameters+=($(project 'parameters
+  #     | to_entries
+  #     | map("\(.key)=\(.value)")
+  #     | .[]'))
+  # }
+
+  [[ $(project secrets) ]] && {
+    parameters+=($(project \
+      --arg n "$Namespace" \
+      --arg p "$Project" \
+      'secrets
+      | to_entries
+      | map("\(.key)=/\($n)/\($p)/secrets/\(.key)")
+      | .[]'))
+  }
+
+  [[ $(project parameters) ]] && {
+    parameters+=($(project \
+      --arg n "$Namespace" \
+      --arg p "$Project" \
+      'parameters
+      | to_entries
+      | map("\(.key)=/\($n)/\($p)/globals/\(.key)")
+      | .[]'))
+  }
+
+  echo "${parameters[@]}"
+  return
+}
+
+deployStack () {
+  printf "Deploying [$Namespace/$Project] in [$Account/${Regions[run]}]\n"
+
+  declare \
+    stack="$Namespace-$Project" \
+    parameters=("State=On")
+
+  parameters+=($(makeParameters)) || return
+
+  declare bucket=""
+  [[ -d $PWD/buckets && $(project publish.buckets) != "false" ]] && {
+    declare buckets=( $(ls buckets/) )
+    bucket="$Namespace-$Name-${buckets[0]}-${Regions[run]}"
+    bucket="--s3-bucket $bucket --s3-prefix templates"
+  }
+
+  printf -- "- Deploying CloudFormation stack:[$stack] ...\n"
+  $Aws cloudformation deploy $bucket \
+    --stack-name "$stack" \
+    --template-file stack.yml \
+    --capabilities CAPABILITY_IAM \
+    --parameter-overrides ${parameters[@]} \
+  || {
+    printf "\nerror!\n\nCaught exit with code:[$?]\n"
+    return 1
+  }
+  printf -- "- Deployment Complete!\n\n"
+
+  return
+}
+
+updateStack () {
+  declare \
+    state
+
+  [[ $Action = "start" ]] && {
+    printf "Starting "
+    state="On"
+  } || {
+    printf "Stopping "
+    state="Off"
+  }
+
+  printf "[$Namespace/$Project] in [$Account/${Regions[run]}]\n"
+
+  declare \
+    stack="$Namespace-$Project" \
+    parameters=(
+      "State=$state"
+    )
+
+  parameters+=($(makeParameters)) || return
+
+  declare bucket
+  [[ -d $PWD/buckets && $(project publish.buckets) != "false" ]] && {
+    declare buckets=( $(ls buckets/) )
+    bucket="$Namespace-$Name-${buckets[0]}-${Regions[run]}"
+    bucket="--s3-bucket $bucket --s3-prefix templates"
+  }
+
+  printf -- "- Updating CloudFormation stack:[$stack] ...\n"
+  $Aws cloudformation deploy $bucket \
+    --stack-name "$stack" \
+    --template-file stack.yml \
+    --capabilities CAPABILITY_IAM \
+    --parameter-overrides ${parameters[@]} \
+  || return
+  printf -- "- Update Complete!\n\n"
+
+  return
+}
+
+destroyStack () {
+  printf "Destroying [$Namespace/$Project] in [$Account/${Regions[run]}]\n"
+
+  declare \
+    stack="$Namespace-$Project" \
+
+  printf -- "- Asking CloudFormation to delete stack:[$stack] ... "
+  $Aws cloudformation delete-stack --stack-name "$stack" \
+    || return
+  printf "done!\n"
+
+  printf -- "- Waiting for CloudFormation to finish ... "
+  $Aws cloudformation wait stack-delete-complete --stack-name "$stack" \
+    || return
+  printf "done!\n"
+
+  destroyParameters
+  destroySecrets
+  destroyContainers
+  destroyBuckets
+
+  printf -- "- Completely Destroyed!\n\n"
+
+  return
+}
+
+cleanStack () {
+  printf "Cleaning [$Namespace/$Project]\n"
+
+  cleanContainers
+
+  printf -- "- Completely Clean!\n\n"
+
+  return
+}
+
+# Init
+################################################################################
+Account="$(project account)" \
+  && Namespace="$(project namespace)" \
+  && Name="$(project name)" \
+  && {
+    Domain="$(project domain)" || unset Domain
+  } \
+  || { echo "Invalid config:[$Config]"; exit 1; }
+
+Project="$Name"
+[[ -v Domain ]] && Project+=".$Domain"
+
+declare -A Regions \
+  && Regions[root]="$(project regions.root)" \
+  && Regions[all]=$(project 'regions|keys|map(select(.!="root"))|.[]') \
+  || {
+    echo "Missing or invalid property:[regions] in config:[$Config]"
+    exit 1
+  }
+
+[[ $Region =~ root|${Regions[root]} ]] && Regions[run]="${Regions[root]}" \
+|| {
+  case $Region in
+    'all')
+      printf "\nStarting synchronous execution for ALL regions\n\n"
+      $0 "$Action" "root" "$Config" && {
+        for region in ${Regions[all]}; do
+          [[ $region = ${Regions[root]} ]] && continue
+          $0 "$Action" "$region" "$Config" || ! break
+        done
+      }
+      exit
+      ;;
+
+    *)
+      [[ ${Regions[all]} =~ "$Region" ]] && Regions[run]="$Region" \
+      || {
+        echo "Specified region:[$Region] is not in config:[$Config]"
+        exit 1
+      }
+  esac
+}
+
+export AWS_PROFILE="${Account:-"default"}"
+Aws="$(which aws) --region ${Regions[run]}"
+
+# Controller
+################################################################################
+case $Action in
+
+  'build') buildStack;;
+  'publish') publishStack;;
+  'deploy') deployStack;;
+  'start'|'stop') updateStack;;
+  'destroy') destroyStack;;
+  'clean') cleanStack;;
+
+  'list')
+    echo "Listing deployments in region:[${Regions[run]}]"
+    fields="Id:StackId,Name:StackName,Status:StackStatus"
+    $Aws cloudformation describe-stacks \
+      --query "Stacks[?starts_with(StackName,'$Namespace')].{$fields}"
+    ;;
+
+  'wipe'|'reset') printf "\nComing soon... nuke it all...\n";;
+
+  *) showHelp; exit 1;;
+
+esac
+
+exit
