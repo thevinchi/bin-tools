@@ -899,15 +899,11 @@ makeParameters() {
     parameters+=($(project 'parameters
       | to_entries
       | map(
-          (
-            if .value|type|inside("array|object") then
-              .value|tojson
-            else
-              .value
-            end
-          ) as $param
-          |
-          "\(.key)=\($param)"
+          if .value|type|inside("array|object") then
+            "\(.key)=\(.value|tojson)"
+          else
+            "\(.key)=\(.value)"
+          end
         )
       | .[]'))
   }
